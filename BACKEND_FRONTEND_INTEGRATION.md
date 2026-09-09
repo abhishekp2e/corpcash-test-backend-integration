@@ -1,652 +1,603 @@
-# Corpcash RBAC — Backend & Frontend Integration Guide
+# Corpcash RBAC — this stack, copy-paste playbook
 
-This document describes how the **Corpcash demo stack** integrates the `@corpcash/rbac-*` library across backend and frontend, how all six authorization concepts are applied, and how to adapt this pattern for production.
+This file is the integration contract for **this repository**. Follow it as written. Do not invent `x-user-id` demo users, port 4000, or a separate `corpcash-backend` app — those are not this POC.
 
-## Repository layout
-
-```
-feature-poc/
-├── corpcash-rback/          # RBAC library (npm packages)
-│   └── packages/
-│       ├── core/            # @corpcash/rbac-core   — authorization engine
-│       ├── node/            # @corpcash/rbac-node   — Express / NestJS adapters
-│       └── react/           # @corpcash/rbac-react  — React hooks & components
-├── corpcash-backend/        # Express API (authoritative security)
-└── corpcash-frontend/       # React UI (UX-only authorization)
-```
-
-Packages are linked locally via `file:` dependencies — no npm publish required for development.
+| Item | Value |
+|------|--------|
+| Backend | `rback-check/backend-integration` · Express ESM · **http://localhost:3000** |
+| Frontend | `rback-check/frontend-integration` · Vite + React 19 · **http://localhost:5173** |
+| Library | npm `@corpcash/rbac-{core,node,store,react}` **^0.3.0** |
+| Auth | `Authorization: Bearer <JWT>` (`sub` = `users.id`) |
+| Roles | Postgres via `@corpcash/rbac-store` (`rbac_roles`, `rbac_assignments`, `rbac_settings`) |
+| Policies | Code only — `backend-integration/rbac.js` |
+| Frontend RBAC | UX only — `RBACProvider` + `permissions[]` from `GET /me/authorization` |
 
 ---
 
-## 1. Architecture overview
+## 0. Prerequisites (do these once)
+
+1. **Node.js ≥ 18**
+2. **Postgres** listening on `localhost:5432` with user `postgres` / password `root` (or change `DATABASE_URL`)
+3. npm access to the public registry (packages `@corpcash/rbac-core`, `rbac-node`, `rbac-store`, `rbac-react` **0.3.0**)
+
+Folder layout for this POC:
+
+```
+rback-check/
+├── backend-integration/        # Express API
+└── frontend-integration/       # React UI
+```
+
+---
+
+## 1. Run this stack (no further decisions)
+
+### Terminal 1 — backend
+
+```bash
+cd /Users/abhishekmishra/WORKDIR/work/feature-poc/rback-check/backend-integration
+cp -n .env.example .env   # skip if .env already exists
+npm install
+npm run dev               # http://localhost:3000
+```
+
+`.env` (already matches `.env.example`):
+
+```
+PORT=3000
+DATABASE_URL=postgresql://postgres:root@localhost:5432/postgres
+JWT_SECRET=dev-jwt-secret-change-in-production
+JWT_EXPIRES_IN=7d
+CORS_ORIGIN=http://localhost:5173
+```
+
+On boot the process:
+
+1. Creates `users` if missing (`auth.js`)
+2. `postgresStore({ pool }).migrate()` → `rbac_roles`, `rbac_assignments`, `rbac_settings`
+3. `store.seed({ roles: rbacConfig.roles })` — **no-op if any role already exists**
+4. `createRBACFromStore(store)` then `registerPolicyFor` in `rbac.js`
+5. Mounts resource routes and `/rbac` admin router
+
+### Terminal 2 — frontend
+
+```bash
+cd /Users/abhishekmishra/WORKDIR/work/feature-poc/rback-check/frontend-integration
+cp -n .env.example .env
+npm install
+npm run dev               # http://localhost:5173
+```
+
+`.env`:
+
+```
+VITE_API_URL=http://localhost:3000
+```
+
+The UI calls that origin **directly** (CORS). The Vite `/api` proxy exists but **is not used** by `src/api.js`.
+
+Open http://localhost:5173 → Register (pick a role) → Dashboard.
+
+---
+
+## 2. Architecture
 
 ```mermaid
 flowchart TB
-  subgraph lib [corpcash-rback]
+  subgraph lib ["@corpcash/rbac-* ^0.3.0 (npm)"]
     Core["@corpcash/rbac-core"]
     Node["@corpcash/rbac-node"]
+    Store["@corpcash/rbac-store"]
     React["@corpcash/rbac-react"]
     Node --> Core
+    Store --> Core
+    Node --> Store
     React --> Core
   end
 
-  subgraph backend [corpcash-backend :4000]
-    AuthMW["Express authorize() middleware"]
-    Policies["Policy functions"]
-    Config["Role / permission config"]
-    Engine["RBAC engine instance"]
-    Config --> Engine
-    Policies --> Engine
-    AuthMW --> Engine
+  subgraph backend [backend-integration :3000]
+    JWT["Bearer JWT → users row"]
+    Sub["resolveSubject → store roles"]
+    Eng["in-memory RBAC engine"]
+    Pol["registerPolicyFor in rbac.js"]
+    MW["authorize() middleware"]
+    Admin["createRbacAdminRouter /rbac"]
+    JWT --> Sub --> Eng
+    Pol --> Eng
+    MW --> Eng
+    Admin --> Store
   end
 
-  subgraph frontend [corpcash-frontend :5173]
-    AuthCtx["AuthProvider"]
-    RBACCtx["RBACProvider"]
-    UI["Can / useCan / capabilities UI"]
-    AuthCtx --> RBACCtx
-    RBACCtx --> UI
+  subgraph frontend [frontend-integration :5173]
+    Auth["AuthProvider GET /me/authorization"]
+    Prov["RBACProvider subject + permissions"]
+    UI["Can / useCan / RequireRole"]
+    Auth --> Prov --> UI
   end
 
-  Node --> AuthMW
-  React --> RBACCtx
-
-  frontend -->|"GET /me/authorization"| backend
-  frontend -->|"GET /wallets, POST, DELETE"| backend
-  frontend -->|"GET /*/capabilities"| backend
+  frontend -->|"Bearer JWT"| backend
 ```
 
 ### Golden rules
 
-1. **One authorization model** — `subject + action + resource (+ context) → allow/deny`
-2. **Backend is the security boundary** — every mutating API route runs `authorize()`
-3. **Frontend never receives policy source code** — only effective permissions and capability results
-4. **Roles/permissions are defined once** on the backend — frontend consumes computed output
-5. **Default deny** — missing permission or failed policy = 403
+1. **One model** — `subject + action + resource (+ context) → allow/deny`
+2. **Backend is the security boundary** — every mutating route runs `authorize()`
+3. **Frontend never receives policy source** — only `permissions[]` and capability results
+4. **Persist roles, not policies** — Postgres holds the role graph and subject assignments; `PolicyFn` / `onDecision` stay in `rbac.js`
+5. **Default deny** — missing permission or failed policy → 403 `{ error: "Forbidden", reason }`
+6. **JWT is identity only** — payload is `{ sub, username }`. Roles always come from `store.getRolesForSubject(sub)` on each request
 
 ---
 
-## 2. The six RBAC concepts
-
-| Concept | Question | Backend location | Frontend usage |
-|---------|----------|------------------|----------------|
-| **Subject** | Who is requesting? | `src/users.ts` → `resolveUser()` | From `GET /me/authorization` → `RBACProvider` |
-| **Role** | What access profile? | `src/rbac/config.ts` | Displayed in concepts panel; drives permissions |
-| **Permission** | What is allowed in general? | `resource:action` in role config | `permissions[]` → `useCan` / `<Can>` |
-| **Action** | What operation? | Route handlers (`read`, `approve`, `deploy`) | Buttons, API calls |
-| **Resource** | On what object? | Type `"wallet"` or instance `{ type, id, ownerId }` | Capabilities API + debugger |
-| **Policy** | Extra conditions? | `src/rbac/policies.ts` | **Not in browser** — use `/capabilities` |
-
-### Evaluation order (backend)
+## 3. Files that matter
 
 ```
-1. Resolve Subject (from auth)
-2. Resolve Roles → Permissions (with inheritance)
-3. Match permission (supports wildcards: wallet:*, *:read, *:*)
-4. Evaluate Policy (if registered for that permission)
-5. Default DENY
+backend-integration/
+├── index.js            # Express: auth, /me/authorization, resources, /rbac
+├── auth.js             # users table, bcrypt, JWT
+├── db.js               # pg Pool from DATABASE_URL
+├── rbac.config.js      # RESOURCES, ACTIONS, PERMISSIONS, seed roles
+├── rbac.js             # store boot, policies, resolveSubject, capabilities
+├── resources.js        # in-memory wallets + transactions (reset on restart)
+└── .env
+
+frontend-integration/
+├── src/api.js
+├── src/AuthContext.jsx
+├── src/ProtectedRoute.jsx          # mounts RBACProvider
+├── src/RequireRole.jsx
+├── src/components/AdminApiPanel.jsx
+├── src/components/ResourceApiPanel.jsx
+└── .env                            # VITE_API_URL
 ```
 
 ---
 
-## 3. Library packages
+## 4. Subject resolution (do not skip)
 
-### `@corpcash/rbac-core`
-
-Framework-agnostic engine. Used directly on the backend; indirectly on the frontend via `@corpcash/rbac-react`.
-
-```typescript
-import { RBAC } from "@corpcash/rbac-core";
-
-const rbac = new RBAC({ roles: { admin: { permissions: ["*:*"] } } });
-
-rbac.registerPolicyFor("wallet", "delete", ({ subject, resource }) => {
-  return typeof resource === "object" && subject.id === resource.ownerId;
-});
-
-rbac.authorize({
-  subject: { id: "dev-1", roles: ["developer"] },
-  action: "delete",
-  resource: { type: "wallet", id: "wallet_1", ownerId: "dev-1" },
-});
-// → { allowed: true, reason: "AUTHORIZED", matchedPermission: "..." }
+```
+Authorization: Bearer <jwt>
+        ↓ verifyToken → { sub, username }
+        ↓ findUserById(sub) → users row
+        ↓ store.getRolesForSubject(String(id))
+        ↓ if empty: fall back to users.role and write that assignment
+        ↓ subject = {
+            id: String(users.id),
+            roles: [...store roles],
+            attributes: { username, organizationId: "org_1" }
+          }
 ```
 
-### `@corpcash/rbac-node`
+`users.role` is the **registration snapshot**. After `PUT /rbac/subjects/:id/roles`, the snapshot can drift. **Authorize and the UI must use `subject.roles`.** `GET /me/authorization` sets `user.role` / `user.roles` from the store.
 
-Express middleware and NestJS guards. The backend uses:
-
-```typescript
-import { createRBAC } from "@corpcash/rbac-node";
-import { createExpressMiddleware } from "@corpcash/rbac-node/express";
-
-const rbac = createRBAC(rbacConfig);
-const { authorize } = createExpressMiddleware({
-  rbac,
-  getSubject: (req) => resolveUser(req.headers["x-user-id"]),
-});
-
-app.get("/wallets", authorize("wallet", "read"), handler);
-app.delete("/wallets/:id", authorize({
-  resource: "wallet",
-  action: "delete",
-  getResource: (req) => ({ type: "wallet", id, ownerId }),
-}), handler);
-```
-
-Returns **401** when no subject, **403** when denied.
-
-### `@corpcash/rbac-react`
-
-Client adapter over the same permission model:
-
-```tsx
-<RBACProvider subject={subject} permissions={permissions}>
-  <Can resource="wallet" action="create">
-    <CreateButton />
-  </Can>
-</RBACProvider>
-```
-
-Uses **permission-only mode** — receives expanded `permissions[]`, not full role config or policies.
+Every subject in this POC has `attributes.organizationId = "org_1"` (unless you add `users.organization_id`). That is required for the approve policy to evaluate.
 
 ---
 
-## 4. Backend integration (corpcash-backend)
+## 5. Seeded role graph (`rbac.config.js`)
 
-### 4.1 Project structure
+`store.seed()` runs only when `rbac_roles` is empty. Later edits go through `/rbac/roles`, not this file. An already-used database may already contain extra roles (for example `auditor`) from earlier admin API calls — `GET /auth/roles` is the live list.
 
-```
-corpcash-backend/src/
-├── index.ts                 # Express app, routes, capabilities builder
-├── users.ts                 # SUBJECT definitions + resolveUser()
-├── rbac/
-│   ├── config.ts            # ROLE + PERMISSION config + UI metadata
-│   └── policies.ts          # POLICY functions + createAppRbac()
-└── store/
-    ├── wallets.ts           # RESOURCE data (wallet instances)
-    └── transactions.ts      # RESOURCE data (transaction instances)
-```
+| Role | Direct permissions | Inherits |
+|------|--------------------|----------|
+| `viewer` | `wallet:read`, `transaction:read`, `dashboard:read` | — |
+| `developer` | `wallet:create`, `wallet:update`, `contract:read`, `contract:deploy` | viewer |
+| `manager` | `transaction:approve`, `wallet:delete`, `user:read`, `report:read` | developer |
+| `admin` | `*:*` | — |
 
-### 4.2 Linking the library
+`GET /auth/roles` returns **current store role names** (includes roles created via `POST /rbac/roles`). Register only accepts those names.
+
+---
+
+## 6. Policies (backend only)
+
+Registered in `rbac.js` **after** `createRBACFromStore`. `reloadFromStore` keeps them attached.
+
+### `wallet:delete` — ownership
+
+If `resource` is an object with `ownerId`, require `subject.id === String(ownerId)`. If `resource` is only the type string (`"wallet"`), the policy **returns true** (Type A / `GET /me/authorization` cannot know an instance).
+
+### `transaction:approve` — org + amount
+
+If `resource` is an object:
+
+1. If both `subject.attributes.organizationId` and `resource.organizationId` are set and differ → deny
+2. If `amount > 100000` → allow only when `subject.roles` includes `"admin"`
+3. Otherwise allow
+
+Same skip rule: type-string resource → policy returns true.
+
+`*:*` still **runs policies**. Admin is denied on `tx_3` (org_2).
+
+---
+
+## 7. Type A vs Type B (frontend)
+
+| | Type A — generic UI | Type B — instance UI |
+|--|---------------------|----------------------|
+| When | Not tied to a specific record | Ownership / org / amount on **this** record |
+| Data | `permissions[]` or `capabilities` from `GET /me/authorization` | `GET /wallets/:id/capabilities` or `GET /transactions/:id/capabilities` |
+| Hook | `useCan("wallet", "delete")` / `<Can>` | `caps.capabilities.delete.allowed` |
+| Policy | **Not evaluated** (resource is a type string) | **Evaluated** (resource is an object) |
+
+Never re-implement policies in React. Even if a button is visible, the mutating API re-runs `authorize()`.
+
+---
+
+## 8. API contract (this server)
+
+All JSON. Authenticated routes: `Authorization: Bearer <token>`.
+
+Unauthenticated → `401 { "error": "Unauthorized" }` or `{ "error": "Invalid or expired token" }`.
+
+Denied by RBAC middleware → `403 { "statusCode": 403, "error": "Forbidden", "message": "...", "reason": "PERMISSION_DENIED" | "POLICY_DENIED" | ... }`.
+
+### 8.1 Health
+
+`GET /health` → `{ "status": "ok", "db": "up" }` (or `503` if Postgres is down).
+
+### 8.2 Auth
+
+`GET /auth/roles` → `{ "roles": ["admin", "developer", "manager", "viewer", ...] }` (sorted as stored).
+
+`POST /auth/register`
 
 ```json
-{
-  "dependencies": {
-    "@corpcash/rbac-core": "file:../corpcash-rback/packages/core",
-    "@corpcash/rbac-node": "file:../corpcash-rback/packages/node"
-  }
-}
+{ "username": "alice", "password": "secret1", "role": "manager" }
 ```
 
-Rebuild library after changes:
+- `201` `{ "token": "<jwt>", "user": { "id": 1, "username": "alice", "role": "manager", "roles": ["manager"] } }`
+- `400` username &lt; 3 chars, password &lt; 6, or unknown role
+- `409` username taken
 
-```bash
-cd ../corpcash-rback
-pnpm build --filter @corpcash/rbac-core --filter @corpcash/rbac-node
-```
+Also writes `store.setRolesForSubject(String(id), [role])`.
 
-### 4.3 Subject (authentication → authorization)
+`POST /auth/login` — same body without `role`. `200` same `{ token, user }` shape. `401` invalid credentials.
 
-**Demo:** `x-user-id` header maps to a predefined subject.
+### 8.3 Authorization bootstrap (frontend must call this after login)
 
-**Production:** Replace `resolveUser()` with JWT/session lookup:
-
-```typescript
-function resolveUser(req: Request): Subject | null {
-  const claims = verifyJwt(req.headers.authorization);
-  if (!claims) return null;
-  return {
-    id: claims.sub,
-    roles: claims.roles,           // from identity provider or DB
-    attributes: {
-      organizationId: claims.orgId,
-      department: claims.dept,
-    },
-  };
-}
-```
-
-Demo subjects (`src/users.ts`):
-
-| Header value | Subject ID | Roles | Org |
-|--------------|------------|-------|-----|
-| `viewer` | viewer-1 | viewer | org_1 |
-| `developer` | dev-1 | developer | org_1 |
-| `admin` | admin-1 | admin | org_1 |
-
-### 4.4 Roles & permissions
-
-Defined in `src/rbac/config.ts`:
-
-```typescript
-roles: {
-  viewer: {
-    permissions: ["wallet:read", "transaction:read"],
-  },
-  developer: {
-    inherits: ["viewer"],
-    permissions: [
-      "wallet:create", "wallet:update", "wallet:delete",
-      "transaction:approve", "contract:read", "contract:deploy",
-    ],
-  },
-  admin: {
-    permissions: ["*:*"],
-  },
-}
-```
-
-`rbac.getEffectivePermissions(subject)` expands inheritance into a flat list for the frontend.
-
-### 4.5 Policies
-
-Registered in `src/rbac/policies.ts`:
-
-**Policy 1 — `wallet:delete` (ownership)**
-
-```typescript
-subject.id === resource.ownerId
-```
-
-**Policy 2 — `transaction:approve` (org + amount)**
-
-```typescript
-subject.attributes.organizationId === resource.organizationId
-&& (amount <= 100_000 || subject.roles.includes("admin"))
-```
-
-Policies run **after** permission match. A user with `wallet:delete` who is not the owner gets `POLICY_DENIED`.
-
-### 4.6 API reference
-
-#### `GET /me/authorization`
-
-Primary contract for frontend bootstrap.
-
-**Request:** `x-user-id: developer`
-
-**Response:**
+`GET /me/authorization`
 
 ```json
 {
   "subject": {
-    "id": "dev-1",
-    "roles": ["developer"],
-    "attributes": { "organizationId": "org_1", "department": "engineering" }
+    "id": "1",
+    "roles": ["manager"],
+    "attributes": { "username": "alice", "organizationId": "org_1" }
   },
-  "roles": ["developer"],
-  "permissions": ["wallet:create", "wallet:update", "wallet:delete", "..."],
-  "roleDefinitions": { "viewer": { "description": "...", "permissions": [...] } },
-  "policies": [
-    { "permission": "wallet:delete", "description": "...", "evaluatedOn": "backend" }
-  ],
-  "concepts": { "subject": "...", "role": "...", ... }
+  "roles": ["manager"],
+  "permissions": ["wallet:read", "wallet:create", "transaction:approve", "..."],
+  "capabilities": {
+    "dashboard:read": true,
+    "wallet:read": true,
+    "wallet:create": true,
+    "wallet:update": true,
+    "wallet:delete": true,
+    "transaction:read": true,
+    "transaction:approve": true,
+    "contract:read": true,
+    "contract:deploy": true,
+    "user:read": true,
+    "report:read": true,
+    "rbac:manage": false
+  },
+  "user": { "id": 1, "username": "alice", "role": "manager", "roles": ["manager"] }
 }
 ```
 
-#### `POST /rbac/authorize`
+`capabilities` is Type A (boolean per `resource:action`). `user.role` is `subject.roles[0]`.
 
-Debug endpoint — runs full authorization and returns the decision.
+Frontend wiring:
 
-**Body:**
+```jsx
+<RBACProvider subject={authorization.subject} permissions={authorization.permissions}>
+  <Can resource="wallet" action="create">{/* Type A */}</Can>
+</RBACProvider>
+```
+
+### 8.4 Dashboard
+
+`GET /dashboard` — requires `dashboard:read` → `{ "message": "Welcome, alice" }`.
+
+### 8.5 Wallets (in-memory; reset on process restart)
+
+Seeded:
+
+| id | ownerId | Meaning |
+|----|---------|---------|
+| `wallet_1` | `"1"` | First registered user (`users.id = 1`) is the owner |
+| `wallet_2` | `"2"` | Second registered user |
+
+`GET /wallets` — `wallet:read` → `{ "wallets": [ { "id", "ownerId", "label" } ] }`
+
+`POST /wallets` — `wallet:create` → `201` wallet with `ownerId = subject.id`
+
+`GET /wallets/:id/capabilities` — authenticated; **no extra permission**. Type B:
+
+```json
+{
+  "resource": { "type": "wallet", "id": "wallet_1", "ownerId": "1" },
+  "capabilities": {
+    "read":   { "allowed": true,  "reason": "AUTHORIZED", "matchedPermission": "wallet:read" },
+    "update": { "allowed": true,  "reason": "AUTHORIZED", "matchedPermission": "wallet:update" },
+    "delete": { "allowed": false, "reason": "POLICY_DENIED", "matchedPermission": "wallet:delete" }
+  }
+}
+```
+
+`404 { "error": "Wallet not found" }` if id is unknown.
+
+`DELETE /wallets/:id` — `wallet:delete` **and** ownership policy → `{ "deleted": "wallet_1" }`
+
+### 8.6 Transactions (in-memory)
+
+| id | amount | organizationId | Who can approve (this POC) |
+|----|--------|----------------|----------------------------|
+| `tx_1` | 50000 | `org_1` | manager (permission + policy), admin |
+| `tx_2` | 500000 | `org_1` | **admin only** (amount policy) |
+| `tx_3` | 10000 | `org_2` | **nobody** (org mismatch, including admin) |
+
+Developer has **no** `transaction:approve` in this graph.
+
+`GET /transactions` — `transaction:read`
+
+`GET /transactions/:id/capabilities` — Type B for `read` and `approve`
+
+`POST /transactions/:id/approve` — permission + policy → updated row `{ id, amount, organizationId, status: "approved" }`
+
+### 8.7 Contracts
+
+`POST /contracts/deploy` — `contract:deploy`
+
+```json
+{ "name": "demo-contract" }
+```
+
+`201 { "deployed": true, "name": "demo-contract" }`
+
+### 8.8 Authorize debugger
+
+`POST /rbac/authorize` — **any authenticated user** (registered **before** the admin router).
 
 ```json
 {
   "action": "delete",
-  "resource": { "type": "wallet", "id": "wallet_1", "ownerId": "dev-1" }
+  "resource": { "type": "wallet", "id": "wallet_1", "ownerId": "1" }
 }
 ```
-
-**Response:**
 
 ```json
 {
-  "request": { "subject": {...}, "action": "delete", "resource": {...} },
-  "result": {
-    "allowed": true,
-    "reason": "AUTHORIZED",
-    "matchedPermission": "wallet:delete"
-  }
+  "request": { "subject": { "id": "1", "roles": ["manager"], "attributes": {} }, "action": "delete", "resource": {} },
+  "result": { "allowed": true, "reason": "AUTHORIZED", "matchedPermission": "wallet:delete" }
 }
 ```
 
-#### Resource routes
+`400` if `action` or `resource` is missing.
 
-| Method | Path | Permission | Policy |
-|--------|------|------------|--------|
-| GET | `/wallets` | wallet:read | — |
-| POST | `/wallets` | wallet:create | — |
-| DELETE | `/wallets/:id` | wallet:delete | ownership |
-| GET | `/wallets/:id/capabilities` | — | computes read/update/delete |
-| GET | `/transactions` | transaction:read | — |
-| POST | `/transactions/:id/approve` | transaction:approve | org + amount |
-| GET | `/transactions/:id/capabilities` | — | computes read/approve |
-| POST | `/contracts/deploy` | contract:deploy | — |
+### 8.9 Admin API (`createRbacAdminRouter`)
 
-#### Capabilities response
+Every path under `/rbac` except `POST /rbac/authorize` requires `rbac:manage` (admin `*:*` has it).
 
-`GET /wallets/wallet_1/capabilities` (as developer who owns wallet_1):
+| Method | Path | Body | Success |
+|--------|------|------|---------|
+| GET | `/rbac/roles` | | `[{ name, permissions, inherits }]` |
+| POST | `/rbac/roles` | `{ name, permissions?, inherits? }` | `201` role |
+| GET | `/rbac/roles/:name` | | role or `404` |
+| PUT | `/rbac/roles/:name` | `{ permissions?, inherits? }` | role (reloads engine) |
+| DELETE | `/rbac/roles/:name` | | `204` (reloads engine) |
+| GET | `/rbac/subjects/:id/roles` | | `{ subjectId, roles }` |
+| PUT | `/rbac/subjects/:id/roles` | `{ roles: ["developer"] }` | replace all assignments |
+| POST | `/rbac/subjects/:id/roles` | `{ role: "viewer" }` | `201` add one |
+| DELETE | `/rbac/subjects/:id/roles/:role` | | `204` revoke one |
+| GET | `/rbac/settings` | | `{ strictRoles }` |
+| PATCH | `/rbac/settings` | `{ strictRoles: false }` | settings (reloads engine) |
 
-```json
-{
-  "resource": { "type": "wallet", "id": "wallet_1", "ownerId": "dev-1" },
-  "capabilities": {
-    "read":   { "allowed": true,  "reason": "AUTHORIZED", "matchedPermission": "wallet:read" },
-    "update": { "allowed": true,  "reason": "AUTHORIZED", "matchedPermission": "wallet:update" },
-    "delete": { "allowed": true,  "reason": "AUTHORIZED", "matchedPermission": "wallet:delete" }
-  }
-}
-```
+Role-graph writes call `reloadFromStore` (policies stay registered). Assignment writes apply on the **next** `resolveSubject` — refresh `GET /me/authorization` in the UI.
 
-Same developer on `wallet_2` (owner: admin-1):
-
-```json
-"delete": { "allowed": false, "reason": "POLICY_DENIED", "matchedPermission": "wallet:delete" }
-```
+Admin errors: `{ "error": "<ErrorName>", "message": "..." }` with `400` or `404`.
 
 ---
 
-## 5. Frontend integration (corpcash-frontend)
+## 9. Frontend integration (this app)
 
-### 5.1 Project structure
-
-```
-corpcash-frontend/src/
-├── api/client.js              # HTTP client → backend API
-├── context/AuthContext.jsx    # Loads /me/authorization
-├── components/
-│   ├── UserSwitcher.jsx       # Demo user selection
-│   ├── RbacConceptsPanel.jsx  # All 6 concepts (live data)
-│   ├── WalletDashboard.jsx    # Wallets + RBACProvider wrapper
-│   ├── TransactionPanel.jsx   # Transaction approve + policy UI
-│   └── ActionsDemo.jsx        # contract:deploy + authorize debugger
-├── utils/rbac.js              # Permission helpers
-└── App.jsx                    # Root layout
-```
-
-### 5.2 Linking the library
-
-```json
-{
-  "dependencies": {
-    "@corpcash/rbac-react": "file:../corpcash-rback/packages/react"
-  }
-}
-```
-
-Rebuild:
-
-```bash
-cd ../corpcash-rback && pnpm build --filter @corpcash/rbac-react
-```
-
-### 5.3 API proxy (development)
-
-Vite proxies `/api/*` → `http://localhost:4000/*`:
-
-```javascript
-// vite.config.js
-proxy: {
-  '/api': {
-    target: 'http://localhost:4000',
-    rewrite: (path) => path.replace(/^\/api/, ''),
-  },
-}
-```
-
-Frontend calls `/api/me/authorization` → backend `GET /me/authorization`.
-
-Override with `VITE_API_URL=http://localhost:4000` for direct calls (requires CORS — already enabled on backend).
-
-### 5.4 Authentication & authorization bootstrap
-
-```mermaid
-sequenceDiagram
-  participant User
-  participant App
-  participant AuthProvider
-  participant Backend
-  participant RBACProvider
-
-  User->>App: Select "developer"
-  App->>AuthProvider: userId = "developer"
-  AuthProvider->>Backend: GET /me/authorization (x-user-id: developer)
-  Backend-->>AuthProvider: subject, roles, permissions, policies
-  AuthProvider->>RBACProvider: subject + permissions
-  RBACProvider-->>App: useCan / Can ready
-```
-
-**AuthProvider** (`src/context/AuthContext.jsx`):
-
-- Calls `fetchAuthorization(userId)` on mount / user change
-- Stores `subject`, `permissions`, `roleDefinitions`, `policies`
-- Does **not** store or execute policy functions
-
-**RBACProvider** (inside `WalletDashboard`):
+1. `api.js` prefixes every path with `VITE_API_URL` and sends `Authorization: Bearer` from `localStorage` key `rbac_token`.
+2. After login/register, `AuthContext` calls `GET /me/authorization` and stores `subject`, `permissions`, `capabilities`.
+3. `ProtectedRoute` mounts:
 
 ```jsx
-<RBACProvider subject={auth.subject} permissions={auth.permissions}>
+<RBACProvider subject={authorization.subject} permissions={authorization.permissions}>
   {children}
 </RBACProvider>
 ```
 
-### 5.5 Two types of frontend authorization
+4. Type A: `useCan("wallet", "create")`, `<Can resource="wallet" action="create">`.
+5. Type B: Resource APIs panel → `/wallets/:id/capabilities`.
+6. `RequireRole` checks `subject.roles` (no inheritance on the client). A manager is denied on `/roles/developer`.
+7. After `/rbac` writes, `AdminApiPanel` calls `refreshAuthorization()`.
 
-#### Type A — Generic UI (permission-only)
+Do **not** import `@corpcash/rbac-core` or `@corpcash/rbac-store` in the frontend.
 
-Use when the check is **not** tied to a specific resource instance.
+---
+
+## 10. Reproduce this in another Express + React app
+
+### Backend
+
+```bash
+npm install @corpcash/rbac-core@^0.3.0 @corpcash/rbac-node@^0.3.0 @corpcash/rbac-store@^0.3.0 pg jsonwebtoken bcryptjs express cors dotenv
+```
+
+Copy these modules as-is and change only secrets and catalogs:
+
+| Copy | Purpose |
+|------|---------|
+| `db.js` | `Pool({ connectionString: process.env.DATABASE_URL })` |
+| `rbac.config.js` | Edit `RESOURCES` / `ACTIONS` / `rbacConfig.roles` / `CAPABILITY_CHECKS` |
+| `rbac.js` | Keep boot + `resolveSubject`; replace `registerPolicies` |
+| `auth.js` | Keep JWT + `users`; change validation if needed |
+| `index.js` | Keep middleware order: `POST /rbac/authorize` **before** `app.use("/rbac", ...)` |
+| `resources.js` | Replace with your real repositories; keep `getResource` returning `{ type, id, ...policyFields }` |
+
+Boot order that must not change:
+
+```js
+const store = postgresStore({ pool });
+await store.migrate();
+await store.seed({ roles: rbacConfig.roles });
+const rbac = await createRBACFromStore(store, { onDecision });
+rbac.registerPolicyFor(/* your policies */);
+const { authorize } = createExpressMiddleware({
+  rbac,
+  getSubject: (req) => req.subject ?? null,
+});
+app.use("/rbac", requireAuth, loadUser, createRbacAdminRouter({ store, rbac, getSubject: (req) => req.subject }));
+```
+
+Protect a type-only route:
+
+```js
+app.get("/wallets", requireAuth, loadUser, authorize("wallet", "read"), handler);
+```
+
+Protect an instance route (policies need the object):
+
+```js
+app.delete(
+  "/wallets/:id",
+  requireAuth,
+  loadUser,
+  loadWalletParam,
+  authorize({
+    resource: "wallet",
+    action: "delete",
+    getResource: (req) => ({ type: "wallet", id: req.wallet.id, ownerId: req.wallet.ownerId }),
+  }),
+  handler,
+);
+```
+
+Expose Type A + Type B:
+
+```js
+// Type A
+res.json({ permissions: rbac.getEffectivePermissions(subject), capabilities: getCapabilities(subject) });
+// Type B
+res.json(getInstanceCapabilities(subject, walletResource(wallet), ["read", "delete"]));
+```
+
+On register: `await store.setRolesForSubject(String(user.id), [role])`.
+
+### Frontend
+
+```bash
+npm install @corpcash/rbac-react@^0.3.0
+```
 
 ```jsx
-// Show create button if role grants wallet:create
-<Can resource="wallet" action="create">
-  <button>Create Wallet</button>
-</Can>
+const authz = await fetch(`${API}/me/authorization`, { headers: { Authorization: `Bearer ${token}` } }).then((r) => r.json());
 
-const canDeploy = useCan('contract', 'deploy')
+<RBACProvider subject={authz.subject} permissions={authz.permissions}>
+  <Can resource="wallet" action="create"><CreateWallet /></Can>
+</RBACProvider>
 ```
 
-Data source: `permissions[]` from `/me/authorization`.
+Instance buttons:
 
-#### Type B — Instance-level UI (policy-aware)
-
-Use when business rules depend on **this specific record** (ownership, org, amount).
-
-```jsx
-// Fetch backend-computed capabilities (includes policies)
-const caps = await fetchWalletCapabilities(userId, wallet.id)
-const canDelete = caps.capabilities.delete.allowed
-```
-
-**Do not** duplicate policy logic in React. The backend `/capabilities` endpoint runs the same `rbac.authorize()` as the API route.
-
-### 5.6 UI sections mapped to concepts
-
-| UI section | Concepts demonstrated |
-|------------|----------------------|
-| **RBAC Concepts panel** | All 6 — live data from backend |
-| **Wallets table** | Resource instances + capabilities (permission + policy) |
-| **Transactions table** | Action `approve` + org/amount policies |
-| **Actions demo** | Custom action `deploy` + `POST /rbac/authorize` debugger |
-
----
-
-## 6. End-to-end flows
-
-### Flow A — List wallets (permission only)
-
-```
-Frontend                          Backend
-   │                                 │
-   │  GET /wallets                   │
-   │  x-user-id: viewer              │
-   │ ───────────────────────────────►│
-   │                                 │ resolveUser → Subject
-   │                                 │ authorize(wallet, read) → ALLOW
-   │◄─────────────────────────────── │
-   │  200 [ wallets... ]             │
-```
-
-Viewer: allowed. User without `wallet:read`: 403.
-
-### Flow B — Delete wallet (permission + policy)
-
-```
-Frontend                          Backend
-   │                                 │
-   │  DELETE /wallets/wallet_1       │
-   │  x-user-id: developer           │
-   │ ───────────────────────────────►│
-   │                                 │ Permission: wallet:delete ✓ (developer)
-   │                                 │ Policy: ownerId === dev-1 ✓
-   │◄─────────────────────────────── │
-   │  200 { deleted: wallet_1 }      │
-```
-
-Developer deleting admin's wallet:
-
-```
-Permission: wallet:delete ✓
-Policy: ownerId !== dev-1 ✗
-→ 403 POLICY_DENIED
-```
-
-### Flow C — Approve transaction (policy with attributes)
-
-| Transaction | Amount | Org | Developer | Admin |
-|-------------|--------|-----|-----------|-------|
-| tx_1 | ₹50,000 | org_1 | ALLOW | ALLOW |
-| tx_2 | ₹5,00,000 | org_1 | DENY (amount) | ALLOW |
-| tx_3 | ₹10,000 | org_2 | DENY (org) | DENY (org) |
-
-Frontend shows policy reason from `/transactions/:id/capabilities` before enabling the Approve button.
-
-### Flow D — Frontend delete button visibility
-
-```
-1. RBACProvider checks permission: wallet:delete → show delete column logic
-2. Per row: GET /wallets/:id/capabilities → capabilities.delete.allowed
-3. User clicks Delete → DELETE /wallets/:id → backend re-authorizes (never trust UI)
-```
-
-Even if a user manipulates the DOM to show a button, the API returns 403.
-
----
-
-## 7. Production migration checklist
-
-### Authentication
-
-| Demo | Production |
-|------|------------|
-| `x-user-id` header | JWT in `Authorization: Bearer ...` |
-| Static `demoUsers` map | User service / identity provider |
-| Header forwarded by frontend | Token from secure storage / httpOnly cookie |
-
-### Authorization config
-
-| Concern | Recommendation |
-|---------|----------------|
-| Role definitions | Single file or DB — backend only |
-| Policy functions | Backend code only — never expose to client |
-| Frontend permissions | `GET /me/authorization` after login |
-| Instance UI | `GET /resource/:id/capabilities` pattern |
-| Caching | Short TTL on permissions; invalidate on role change |
-
-### Security
-
-- Treat all frontend checks as **UX hints**
-- Log `AuthorizationResult.reason` on denials for audit
-- Use HTTPS in production
-- Restrict CORS to your frontend origin (replace `*`)
-
-### Publishing the library
-
-When ready to move off `file:` dependencies:
-
-```json
-"@corpcash/rbac-core": "^0.1.0",
-"@corpcash/rbac-node": "^0.1.0",
-"@corpcash/rbac-react": "^0.1.0"
+```js
+const { capabilities } = await fetch(`${API}/wallets/${id}/capabilities`, { headers }).then((r) => r.json());
+if (capabilities.delete.allowed) { /* show Delete */ }
 ```
 
 ---
 
-## 8. Local development
+## 11. Smoke tests (copy, replace TOKEN)
 
-### Terminal 1 — Build library (after changes)
-
-```bash
-cd corpcash-rback
-pnpm install
-pnpm build --filter @corpcash/rbac-core --filter @corpcash/rbac-node --filter @corpcash/rbac-react
-```
-
-### Terminal 2 — Backend
+Register an admin (first user is usually `id=1`, which owns `wallet_1`):
 
 ```bash
-cd corpcash-backend
-npm install
-npm run dev    # http://localhost:4000
+TOKEN=$(curl -s -X POST http://localhost:3000/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin1","password":"secret1","role":"admin"}' | jq -r .token)
+
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:3000/me/authorization | jq '{roles, permissions, user}'
+
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:3000/wallets | jq .
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:3000/wallets/wallet_2/capabilities | jq .
+# admin + *:* still hits ownership policy → delete on wallet_2 is POLICY_DENIED unless you are user id 2
+
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:3000/transactions/tx_2/capabilities | jq .
+# approve.allowed true (admin + same org)
+
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:3000/rbac/roles | jq .
 ```
 
-### Terminal 3 — Frontend
+Manager vs high-amount (register a second user as `manager`):
 
 ```bash
-cd corpcash-frontend
-npm install
-npm run dev    # http://localhost:5173
+MT=$(curl -s -X POST http://localhost:3000/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"mgr1","password":"secret1","role":"manager"}' | jq -r .token)
+
+curl -s -H "Authorization: Bearer $MT" http://localhost:3000/transactions/tx_2/capabilities | jq .capabilities.approve
+# { allowed: false, reason: "POLICY_DENIED", ... }
+
+curl -s -o /dev/null -w "%{http_code}\n" -X POST \
+  -H "Authorization: Bearer $MT" http://localhost:3000/transactions/tx_2/approve
+# 403
 ```
 
-### Smoke tests
+Viewer cannot hit `/rbac`:
 
 ```bash
-# Authorization payload
-curl -s -H "x-user-id: developer" http://localhost:4000/me/authorization | jq .
+VT=$(curl -s -X POST http://localhost:3000/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"view1","password":"secret1","role":"viewer"}' | jq -r .token)
 
-# Policy-aware capabilities
-curl -s -H "x-user-id: developer" http://localhost:4000/wallets/wallet_2/capabilities | jq .
-
-# Transaction policy (high amount → denied for developer)
-curl -s -H "x-user-id: developer" http://localhost:4000/transactions/tx_2/capabilities | jq .
+curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $VT" http://localhost:3000/rbac/roles
+# 403
 ```
+
+Username already taken → `409`. Missing Bearer → `401`.
 
 ---
 
-## 9. Troubleshooting
+## 12. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| Frontend "Authorization unavailable" | Backend not running | Start `corpcash-backend` on port 4000 |
-| Old API response shape | Stale backend process | Kill port 4000, restart backend |
-| `Cannot GET /capabilities` | Old backend without new routes | Pull latest, restart |
-| Permission changes not reflected | Library not rebuilt | `pnpm build` in corpcash-rback |
-| CORS errors | Bypassing Vite proxy | Use `/api/...` paths or set CORS origin |
-| Delete button wrong | Using permission-only check | Use `/capabilities` for instance actions |
+| Backend exits on start | Postgres down / wrong `DATABASE_URL` | Start Postgres; match user/password/db |
+| `ECONNREFUSED 5432` | No Postgres | `pg_isready` / start the server |
+| Frontend login fails / CORS | `VITE_API_URL` or `CORS_ORIGIN` | `http://localhost:3000` and `http://localhost:5173` |
+| UI still shows old role after `/rbac` assign | Used `users.role` or stale session | Use `subject.roles`; click Send on Admin panel (it refreshes `/me/authorization`) |
+| Type A says `wallet:delete: true` but DELETE 403 | Type A skips ownership | Call `/wallets/:id/capabilities` |
+| `POST /rbac/authorize` is 403 `rbac:manage` | Route registered after admin router | Keep `app.post("/rbac/authorize")` **above** `app.use("/rbac", ...)` |
+| `/rbac` 403 as manager | No `rbac:manage` | Sign in as `admin` (`*:*`) |
+| Seed changes ignored | `rbac_roles` already populated | `DELETE` extra roles via API, or empty the three `rbac_*` tables and restart |
+| `@corpcash/rbac-*` not found | npm install failed / offline | `npm install` on the public registry; packages are `@corpcash/rbac-core`, `rbac-node`, `rbac-store`, `rbac-react` **^0.3.0** |
+| Wallets empty / unexpected owners | Process restarted or user ids ≠ 1/2 | Restart resets `resources.js`; first two `users.id` values own the seed wallets |
+| JWT `roles` claim missing | Intentional | Engine never reads the JWT for roles |
 
 ---
 
-## 10. Quick reference — who owns what
+## 13. Who owns what
 
 | Data / logic | Owner |
-|--------------|-------|
-| Role definitions | Backend `rbac/config.ts` |
-| Policy functions | Backend `rbac/policies.ts` |
-| Subject identity | Auth system → backend `resolveUser()` |
-| Resource records | Application DB / store |
-| Effective permissions | Backend computes → sent to frontend |
-| Generic UI visibility | Frontend `useCan` / `<Can>` |
-| Instance UI visibility | Backend `/capabilities` |
-| Security enforcement | Backend `authorize()` on every route |
+|--------------|--------|
+| Role definitions | Postgres `rbac_roles` (seeded from `rbac.config.js`) |
+| Subject → roles | Postgres `rbac_assignments` |
+| `users.role` | Registration snapshot only |
+| Policy functions | `rbac.js` |
+| Subject identity | JWT `sub` → `users.id` |
+| Wallet / transaction records | `resources.js` (demo memory) |
+| Effective permissions | Engine → `GET /me/authorization` |
+| Generic UI | `useCan` / `<Can>` |
+| Instance UI | `GET /…/capabilities` |
+| Security | `authorize()` on each route |
 
 ---
 
-## 11. Related documentation
+## 14. Related docs
 
-- Library overview: [`corpcash-rback/README.md`](../corpcash-rback/README.md)
-- Core API: [`corpcash-rback/packages/core/README.md`](../corpcash-rback/packages/core/README.md)
-- Node adapters: [`corpcash-rback/packages/node/README.md`](../corpcash-rback/packages/node/README.md)
-- React adapters: [`corpcash-rback/packages/react/README.md`](../corpcash-rback/packages/react/README.md)
-- Backend README: [`corpcash-backend/README.md`](../corpcash-backend/README.md)
-- Frontend README: [`corpcash-frontend/README.md`](../corpcash-frontend/README.md)
+- npm: [`@corpcash/rbac-core`](https://www.npmjs.com/package/@corpcash/rbac-core), [`rbac-node`](https://www.npmjs.com/package/@corpcash/rbac-node), [`rbac-store`](https://www.npmjs.com/package/@corpcash/rbac-store), [`rbac-react`](https://www.npmjs.com/package/@corpcash/rbac-react)
+- In-app copy of this guide: frontend `/docs`

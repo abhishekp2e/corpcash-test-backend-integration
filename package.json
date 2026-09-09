@@ -12,8 +12,9 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@corpcash/rbac-core": "^0.2.0",
-    "@corpcash/rbac-node": "^0.2.0",
+    "@corpcash/rbac-core": "^0.3.0",
+    "@corpcash/rbac-node": "^0.3.0",
+    "@corpcash/rbac-store": "^0.3.0",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",

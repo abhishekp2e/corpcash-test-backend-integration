@@ -20,7 +20,7 @@ export async function initUsersTable() {
 
 export function signToken(user) {
   return jwt.sign(
-    { sub: String(user.id), username: user.username, roles: [user.role] },
+    { sub: String(user.id), username: user.username },
     JWT_SECRET,
     { expiresIn: JWT_EXPIRES_IN },
   );
@@ -30,7 +30,7 @@ export function verifyToken(token) {
   return jwt.verify(token, JWT_SECRET);
 }
 
-export async function registerUser({ username, password, role }) {
+export async function registerUser({ username, password, role, roles }) {
   const normalized = String(username ?? "").trim();
   if (!normalized || normalized.length < 3) {
     const err = new Error("Username must be at least 3 characters");
@@ -42,8 +42,9 @@ export async function registerUser({ username, password, role }) {
     err.status = 400;
     throw err;
   }
-  if (!ROLES.includes(role)) {
-    const err = new Error(`Role must be one of: ${ROLES.join(", ")}`);
+  const allowed = Array.isArray(roles) && roles.length ? roles : ROLES;
+  if (!allowed.includes(role)) {
+    const err = new Error(`Role must be one of: ${allowed.join(", ")}`);
     err.status = 400;
     throw err;
   }
@@ -105,10 +106,16 @@ export async function findUserById(id) {
   return result.rows[0] ?? null;
 }
 
-export function toSubject(user) {
+/**
+ * Public user for auth responses. `role` / `roles` must come from the store
+ * subject (not the `users.role` registration snapshot).
+ */
+export function toPublicUser(user, subject) {
+  const roles = subject?.roles?.length ? subject.roles : user.role ? [user.role] : [];
   return {
-    id: String(user.id),
-    roles: [user.role],
-    attributes: { username: user.username },
+    id: user.id,
+    username: user.username,
+    role: roles[0] ?? user.role,
+    roles,
   };
 }

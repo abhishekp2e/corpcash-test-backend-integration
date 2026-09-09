@@ -1,9 +1,12 @@
 /**
- * RBAC catalog for the backend.
+ * RBAC catalog used as the *initial seed* for @corpcash/rbac-store.
  *
- * This is the single source of truth for resources, actions, roles, and
- * permissions. Routes and capability APIs should import from here instead of
- * hard-coding "wallet:read"-style strings (avoids typos / drift).
+ * After first boot, live role definitions live in Postgres (`rbac_roles`).
+ * Changing this file does not update an already-seeded database — use
+ * `/rbac/roles` (or re-seed an empty store). Policies stay in `rbac.js`.
+ *
+ * Routes and capability APIs should import RESOURCES / ACTIONS / perm()
+ * instead of hard-coding "wallet:read"-style strings.
  *
  * Permission format used by @corpcash/rbac-*: "resource:action"
  * Wildcards: "wallet:*", "*:read", "*:*"
@@ -23,6 +26,7 @@ export const RESOURCES = Object.freeze({
   contract: "contract",
   user: "user",
   report: "report",
+  rbac: "rbac",
 });
 
 /**
@@ -36,11 +40,12 @@ export const ACTIONS = Object.freeze({
   delete: "delete",
   approve: "approve",
   deploy: "deploy",
+  manage: "manage",
 });
 
 /**
- * Assignable roles at registration / in the users table.
- * Must match keys under rbacConfig.roles.
+ * Default assignable roles at first seed / registration fallback.
+ * After seed, GET /auth/roles reads store.listRoles() (may include extra roles).
  */
 export const ROLES = Object.freeze(["viewer", "developer", "manager", "admin"]);
 
@@ -77,6 +82,7 @@ export const PERMISSIONS = Object.freeze({
   contractDeploy: perm(RESOURCES.contract, ACTIONS.deploy),
   userRead: perm(RESOURCES.user, ACTIONS.read),
   reportRead: perm(RESOURCES.report, ACTIONS.read),
+  rbacManage: perm(RESOURCES.rbac, ACTIONS.manage),
   all: ALL,
 });
 
@@ -84,14 +90,13 @@ export const PERMISSIONS = Object.freeze({
 const KNOWN_PERMISSIONS = new Set(Object.values(PERMISSIONS));
 
 /**
- * Role graph passed to createRBAC().
+ * Role graph seeded once via store.seed({ roles }).
  *
  * - permissions: granted directly to the role
  * - inherits: also receives permissions from parent role(s)
  * - admin uses "*:*" instead of listing every permission
  *
- * Effective permissions for a user are expanded by the RBAC engine
- * (see GET /me/authorization).
+ * Effective permissions are expanded by the engine (GET /me/authorization).
  */
 export const rbacConfig = {
   roles: {
@@ -145,6 +150,7 @@ export const CAPABILITY_CHECKS = Object.freeze([
   [RESOURCES.contract, ACTIONS.deploy],
   [RESOURCES.user, ACTIONS.read],
   [RESOURCES.report, ACTIONS.read],
+  [RESOURCES.rbac, ACTIONS.manage],
 ]);
 
 /**
